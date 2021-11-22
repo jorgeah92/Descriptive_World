@@ -17,6 +17,7 @@ import json
 import cv2
 import datetime
 import numpy as np
+import base64
 import torch
 import torch.backends.cudnn as cudnn
 
@@ -83,13 +84,16 @@ def model_fn(model_path):
     print("bcj_end model_fn")
     return model
 
-def input_fn(input_data, content_type):
-    # Expects input_data in format bytestring of an image (ex. JPEG)
+def input_fn(input_data, content_type='JPEG', *argparams, **kwparams):#custom_attributes=None):
+    # Expects input_data in format bytestring of an image (ex. JPEG) or URL (string of http://)
     # deserializes the prediction input
     print("bcj_start input_fn")
     print("bcj_ input_data type:", type(input_data))
+    print("bcj_ argparams", argparams)
+    print("bcj_ kwparams", kwparams)
 
-    if type(input_data) == 'str': # this is used for debugging when invoking from CLI
+
+    if content_type == 'URL': # this is used for debugging when invoking from CLI
                                 #  DO NOT USE for endpoint deployment
         r = requests.get(input_data)
         img_str = r.content
@@ -101,8 +105,12 @@ def input_fn(input_data, content_type):
 
     if im0s is None: # should only ever occur when calling from CLI in debugging mode (not endpoint deployed)
         print('bcj_ no image data found at location:', input_data)
-        print('bcj_ request response:', r)
-        return None
+        if r is not None:
+            print('bcj_ request response:', r)
+        err = createOutputTemplate()
+        err['status'] = 'Error'
+        err['status-description'] = 'Problem with image data'
+        return err
     
     # Padded resize
     img = letterbox(im0s, opt['imgsz'], stride=opt['stride'], auto=opt['pt'])[0]
@@ -124,12 +132,17 @@ def predict_fn(input_data, model):
     # calls the model on the deserialized data.
     print("start predict_fn")
     
+    err = createOutputTemplate()
+    err['status'] = 'Error'
+
     if (input_data is None):
         print('bcj_ input_data is None')
-        return None
+        err['status-description'] = 'No input data found'
+        return err
     if (model is None):
         print('bcj_ model is None')
-        return None
+        err['status-description'] = 'No model found'
+        return err
     
     img = input_data[0]
     im0s = input_data[1] # pass-through for output_fn ("gn" calc)
@@ -138,7 +151,7 @@ def predict_fn(input_data, model):
     pred = non_max_suppression(pred, opt['conf_thres'], opt['iou_thres'], opt['classes'], opt['agnostic_nms'], max_det=opt['max_det'])
     
     print("bcj_end predict_fn")
-    return [pred, img.shape, im0s.shape]  # returning img and im0s per yolov5 code for output_fn (gn calc)
+    return [pred, img, im0s]  # returning img and im0s per yolov5 code for output_fn (gn calc)
 
 def output_fn(prediction_output, accept):
     # serializes the prediction output.
@@ -146,11 +159,17 @@ def output_fn(prediction_output, accept):
     
     if prediction_output is None:
         print('bcj_ prediction_output is None')
-        return None
+        err = createOutputTemplate()
+        err['status'] = 'Error'
+        err['status-description'] = 'Prediction output was None'
+        return err
 
     pred = prediction_output[0] 
-    img_shape  = prediction_output[1]
-    im0s_shape = prediction_output[2]
+    img  = prediction_output[1]
+    im0s = prediction_output[2]
+    
+    img_shape = img.shape
+    im0s_shape = im0s.shape
     
     # Process predictions
     output = createOutputTemplate()
@@ -158,8 +177,12 @@ def output_fn(prediction_output, accept):
     output["bounding-box-attribute-name"]["image_size"][0]["height"] = im0s_shape[0]
     output["bounding-box-attribute-name"]["image_size"][0]["depth"] = im0s_shape[2]
     
+    detections = False
+    
     for i, det in enumerate(pred):  # per image
         if len(det):
+            detections = True
+            
             # Rescale boxes from img_size to im0 size
             det[:, :4] = scale_coords(img_shape[2:], det[:, :4], im0s_shape).round()
             
@@ -180,6 +203,9 @@ def output_fn(prediction_output, accept):
                 output["bounding-box-attribute-name-metadata"]["class-map"][str(int(cls))] = opt['names'][int(cls)]
 
     print("bcj_output", output)
+    
+    output["original-image"] = base64.b64encode(im0s).decode() # add after logging to cloudwatch
+
     print("bcj_end output_fn")
     return json.dumps(output)
 
@@ -225,48 +251,11 @@ def createOutputTemplate():
             "human-annotated": "no",
             "creation-date": str(datetime.datetime.now()),
             "job-name": "descriptive_world_identify_garments"
-        }
+        },
+        "original-image": "",
     }
     return template
-"""
-This is a reference JSON output found at:  https://docs.aws.amazon.com/sagemaker/latest/dg/sms-data-output.html
-{
-    "source-ref": "s3://AWSDOC-EXAMPLE-BUCKET/example_image.png",
-    "bounding-box-attribute-name":
-    {
-        "image_size": [{ "width": 500, "height": 400, "depth":3}],
-        "annotations":
-        [
-            {"class_id": 0, "left": 111, "top": 134,
-                    "width": 61, "height": 128},
-            {"class_id": 5, "left": 161, "top": 250,
-                     "width": 30, "height": 30},
-            {"class_id": 5, "left": 20, "top": 20,
-                     "width": 30, "height": 30}
-        ]
-    },
-    "bounding-box-attribute-name-metadata":
-    {
-        "objects":
-        [
-            {"confidence": 0.8},
-            {"confidence": 0.9},
-            {"confidence": 0.9}
-        ],
-        "class-map":
-        {
-            "0": "dog",
-            "5": "bone"
-        },
-        "type": "groundtruth/object-detection",
-        "human-annotated": "yes",
-        "creation-date": "2018-10-18T22:18:13.527256",
-        "job-name": "identify-dogs-and-toys"
-    }
- }
 
-
-"""
 
 if False:#__name__ == "__main__": # remove False to run from CLI
     # test harness code: run this from CLI before deploying to Sagemaker Endpoint
@@ -275,7 +264,7 @@ if False:#__name__ == "__main__": # remove False to run from CLI
     tst_model = model_fn('./')
     
     #input_data_url = './data/images/bus.jpg'
-    input_data_url = 'https://media.gq.com/photos/60f9c697101cc04fad71e5cf/master/pass/BEST-BASICS-1.jpg'
+    input_data_url = 'https://d2ph5fj80uercy.cloudfront.net/04/cat1600.jpg'
     #input_data_url = 'https://descriptiveworld-datasets.s3.us-west-2.amazonaws.com/Fashion_Product_Images/images/10003.jpg'
     r = requests.get(input_data_url)
     img_bstr = r.content
@@ -286,3 +275,5 @@ if False:#__name__ == "__main__": # remove False to run from CLI
     tst_out = output_fn(tst_pred, 'accept')
     print(tst_out)
     print("bcj_end main")
+
+ 
