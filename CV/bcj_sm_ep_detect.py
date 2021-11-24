@@ -1,7 +1,7 @@
-# YOLOv5 🚀 by Ultralytics, GPL-3.0 license
 """
 Run inference on images, videos, directories, streams, etc.
 
+Inspired by detect.py from YOLOv5 🚀 by Ultralytics
 Adapted to run as SageMaker Endpoint by Blair Jones on 03 Nov 2021.
 Inspired by example at:  https://sagemaker-examples.readthedocs.io/en/latest/aws_sagemaker_studio/frameworks/pytorch_cnn_cifar10/pytorch_cnn_cifar10.html
 
@@ -204,7 +204,7 @@ def output_fn(prediction_output, accept):
 
     print("bcj_output", output)
     
-    output["original-image"] = base64.b64encode(im0s).decode() # add after logging to cloudwatch
+    #mdw# output["original-image"] = base64.b64encode(im0s).decode() # add after logging to cloudwatch
 
     print("bcj_end output_fn")
     return json.dumps(output)
@@ -257,7 +257,7 @@ def createOutputTemplate():
     return template
 
 
-if False:#__name__ == "__main__": # remove False to run from CLI
+if __name__ == "__main__": # remove False to run from CLI
     # test harness code: run this from CLI before deploying to Sagemaker Endpoint
     print("bcj_start main")
     
