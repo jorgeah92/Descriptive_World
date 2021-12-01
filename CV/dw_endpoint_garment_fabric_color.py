@@ -57,7 +57,7 @@ opt['ptrnstride']=32
 opt['ptrnnames'] = [f'class{i}' for i in range(1000)]  # assign defaults
 
 detectFabric = True
-detectColor = False
+detectColor = True
 
 def model_fn(model_path):
     # loads the model from disk. This function must be implemented.
@@ -238,14 +238,14 @@ def output_fn(prediction_output, accept):
                 output["bounding-box-attribute-name-metadata"]["class-map"][str(int(cls))] = opt['names'][int(cls)]
                 
                 if detectFabric: # toggle for fabric detection feature
-                    fabric_prediction, crop_img = detectFabricPattern(xyxy, im0s)
+                    fabric_prediction, crop_img = detectFabricPattern(xyxy, im0s)                    
                     print("dw_ Detected fabric =", fabric_prediction)
-                    output["bounding-box-attribute-name"]["fabric_predictions"].append(fabric_prediction)
+                    output["bounding-box-attribute-name-metadata"]["fabric_predictions"].append(createMetadataFabrics(fabric_prediction))
                 
                 if detectColor: # toggle for color detection feature
                     color_prediction = detectColor(crop_img)
                     print("dw_ Detected color =", color_prediction)
-                    output["bounding-box-attribute-name"]["color_predictions"].append(color_prediction)
+                    output["bounding-box-attribute-name-metadata"]["color_predictions"].append(createMetadataColors(color_prediction))
                 
     print("dw_output", output)
     
@@ -296,6 +296,7 @@ def detectFabricPattern(xyxy, im0s):
             hide_conf = True
             label_p = None if hide_labels else (opt['ptrnnames'][c_p] if hide_conf else f"{opt['ptrnnames'][c_p]} {conf_p:.2f}")
         break # use on the first prediction
+    label_p = label_p.replace('_fabric', '')
     return label_p, crop_img
 
 
@@ -358,31 +359,37 @@ def createAnnotation(cls_id, img_dim, ctr_x_pct, ctr_y_pct, w_pct, h_pct):
 
 def createMetadataObjects(conf):
     return {"confidence": conf}
+
+def createMetadataFabrics(fabric_prediction):
+    return {"fabric": fabric_prediction}
+
+def createMetadataColors(color_prediction):
+    return {"color": color_prediction}
             
 def createOutputTemplate():
     template = {
         "source-ref": "TBD",
+        "original-image": "TBD",
         "num-detected-objects": 0,
         "bounding-box-attribute-name":
         {
             "image_size": [{ "width": 0, "height": 0, "depth":0}],
-            "annotations": [],
-            "fabric_predictions": [],
-            "color_predictions": []
+            "annotations": []
         },
         "bounding-box-attribute-name-metadata":
         {
             "objects": [],
+            "fabric_predictions": [],
+            "color_predictions": [],
             "class-map": {},
             "type": "descriptiveworld/object-detection",
             "human-annotated": "no",
             "creation-date": str(datetime.datetime.now()),
             "job-name": "descriptive_world_identify_garments"
         },
-        "original-image": "",
     }
     return template
-
+    
 
 if __name__ == "__main__": # remove False to run from CLI
     # test harness code: run this from CLI before deploying to Sagemaker Endpoint
