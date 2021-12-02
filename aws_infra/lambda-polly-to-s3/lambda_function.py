@@ -49,9 +49,12 @@ def lambda_handler(event, context):
         stream = response["AudioStream"]
         
         # Store files (current and named)
-        bucket.put_object(Key=fragment_filename, Body=stream.read())
+        ##bucket.put_object(Key=fragment_filename, Body=stream.read())
         # make a copy as current
-        s3.Object(bucket_name, current_filename).copy_from(CopySource=bucket_name + "/" + fragment_filename)
+        ##s3.Object(bucket_name, current_filename).copy_from(CopySource=bucket_name + "/" + fragment_filename)
+        bucket.put_object(Key=current_filename, Body=stream.read())
         print("END OF EXECUTION")
           
         return 'Successfully processed {} records.'.format(len(event['Records']))
+
+
