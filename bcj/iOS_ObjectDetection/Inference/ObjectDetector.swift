@@ -26,3 +26,24 @@ class ObjectDetector {
         }
     }()
 }
+
+class PatternDetector {
+    lazy var module: InferenceModule = {
+        if let filePath = Bundle.main.path(forResource: "fabric1.torchscript", ofType: "ptl"),
+        //if let filePath = Bundle.main.path(forResource: "yolov5s.torchscript", ofType: "ptl"),
+            let module = InferenceModule(fileAtPath: filePath) {
+            return module
+        } else {
+            fatalError("Failed to load model!")
+        }
+    }()
+    
+    lazy var classes: [String] = {
+        if let filePath = Bundle.main.path(forResource: "classes_pattern", ofType: "txt"),
+            let classes = try? String(contentsOfFile: filePath) {
+            return classes.components(separatedBy: .newlines)
+        } else {
+            fatalError("classes file was not found.")
+        }
+    }()
+}

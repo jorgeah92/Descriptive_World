@@ -10,12 +10,17 @@ import UIKit
 import AVFoundation
 import Speech
 import NaturalLanguage
+
+public let audioSession = AVAudioSession.sharedInstance()
+public let synthesizer = AVSpeechSynthesizer()
 // end BCJ
+
 
 class ViewController: UIViewController, UIImagePickerControllerDelegate, UINavigationControllerDelegate{
     @IBOutlet weak var imageView: UIImageView!
     @IBOutlet weak var txtVoice: UITextView! // BCJ
     @IBOutlet weak var camView: UIView! // BCJ
+    @IBOutlet weak var imgMic: UIImageView!
     @IBOutlet weak var btnRun: UIButton!
     @IBOutlet weak var btnVoice: UIButton!
     @IBOutlet weak var btnCamera: UIButton!
@@ -24,7 +29,6 @@ class ViewController: UIViewController, UIImagePickerControllerDelegate, UINavig
     private let testImages = ["test1.png", "test2.jpg", "test3.png"]
     private var imgIndex = 0
 
-    private var image : UIImage?
     private var inferencer = ObjectDetector()
     
     // start BCJ
@@ -32,8 +36,7 @@ class ViewController: UIViewController, UIImagePickerControllerDelegate, UINavig
     private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
     private var recognitionTask: SFSpeechRecognitionTask?
     private let audioEngine = AVAudioEngine()
-    private let audioSession = AVAudioSession.sharedInstance()
-    
+
     private var videoDataOutput: AVCaptureVideoDataOutput!
     private var videoDataOutputQueue: DispatchQueue!
     private var previewLayer:AVCaptureVideoPreviewLayer!
@@ -44,37 +47,75 @@ class ViewController: UIViewController, UIImagePickerControllerDelegate, UINavig
     private var camImage: UIImage!
     
     private var voice_timer: Timer!
-    // end BCJ
+    private var continuous_timer: Timer!
+    private var restart_timer: Timer!
+    private var relaunch_timer: Timer!
+
+    private var fullsTring: String!
+
+    private var detectingState = false
+    private var voiceMode = false
+    
+    private var long_synthesizer = AVSpeechSynthesizer()
+    
+    func toggleTorch(on: Bool) {
+        guard let device = AVCaptureDevice.default(for: AVMediaType.video) else { return }
+        guard device.hasTorch else { print("Torch isn't available"); return }
+
+        do {
+            try device.lockForConfiguration()
+            device.torchMode = on ? .on : .off
+            if on { try device.setTorchModeOn(level: AVCaptureDevice.maxAvailableTorchLevel) }
+            device.unlockForConfiguration()
+        } catch {
+            print("Torch can't be used")
+        }
+    }
+    
+    @objc func activateTorch() {
+        toggleTorch(on: true)
+    }
     
     override func viewDidLoad() {
         super.viewDidLoad()
-        image = UIImage(named: testImages[imgIndex])!
         if let iv = imageView {
-            iv.image = image
+            iv.image = UIImage(named: testImages[imgIndex])!
             btnRun.setTitle("Detect", for: .normal)
         }
         // start BCJ
-        let utterance = AVSpeechUtterance(string: "Descriptive World")
-        //utterance.volume = 0.5
-        let synthesizer = AVSpeechSynthesizer()
-        synthesizer.speak(utterance)
+        btnVoice.backgroundColor = UIColor.systemGreen
+        
+        try? audioSession.setCategory(AVAudioSession.Category.playAndRecord, mode: AVAudioSession.Mode.default, options: AVAudioSession.CategoryOptions.defaultToSpeaker)
+        try? audioSession.setMode(AVAudioSession.Mode.spokenAudio)
+        try? audioSession.setActive(true, options: .notifyOthersOnDeactivation)
+        
+        synthesizer.speak(AVSpeechUtterance(string: "Descriptive World"))
+        long_synthesizer.delegate = self
+
+        NotificationCenter.default.addObserver(self,
+                                               selector: #selector(activateTorch),
+                                               name: UIApplication.didBecomeActiveNotification,
+                                               object: nil)
+        startVoice(self)
         // end BCJ
     }
-    
+        
     @IBAction func runTapped(_ sender: Any) {
         detectObject()
     }
 
     @IBAction func nextTapped(_ sender: Any) {
+        print("nextTapped")
         PrePostProcessor.cleanDetection(imageView: imageView)
+        self.txtVoice.text = ""
         imgIndex = (imgIndex + 1) % testImages.count
         btnNext.setTitle(String(format: "Test Image %d/%d", imgIndex + 1, testImages.count), for:.normal)
-        image = UIImage(named: testImages[imgIndex])!
-        imageView.image = image
+        imageView.image = UIImage(named: testImages[imgIndex])!
     }
 
     @IBAction func photosTapped(_ sender: Any) {
         PrePostProcessor.cleanDetection(imageView: imageView)
+        self.txtVoice.text = ""
         let imagePickerController = UIImagePickerController()
         imagePickerController.delegate = self;
         imagePickerController.sourceType = .photoLibrary
@@ -83,6 +124,7 @@ class ViewController: UIViewController, UIImagePickerControllerDelegate, UINavig
     
     @IBAction func cameraTapped(_ sender: Any) {
         PrePostProcessor.cleanDetection(imageView: imageView)
+        self.txtVoice.text = ""
         if UIImagePickerController.isSourceTypeAvailable(.camera) {
             let imagePickerController = UIImagePickerController()
             imagePickerController.delegate = self;
@@ -93,16 +135,27 @@ class ViewController: UIViewController, UIImagePickerControllerDelegate, UINavig
     
     private func voiceTapped() {
         PrePostProcessor.cleanDetection(imageView: self.imageView)
-        if (self.btnVoice.title(for: .normal) == "Voice") {
-            self.btnVoice.setTitle("Tap to stop", for: .normal)
+        self.txtVoice.text = ""
+        if (!self.voiceMode) { // start voice processing
+            self.voiceMode = true
+            //self.btnVoice.setImage(UIImage(systemName: "mic.circle"), for: .normal)
+            self.btnVoice.setTitle("Stop", for: .normal)
+            self.btnVoice.backgroundColor = UIColor.systemPurple
+            sayReady()
             self.camView.isHidden = false
             self.imageView.isHidden = true
             self.setupAVCapture()
-        } else {
-            //DispatchQueue.main.async {
-            self.imageView.image = self.camImage
-            //}
-            self.btnVoice.setTitle("Voice", for: .normal)
+        } else { // shutdown voice processing
+            self.voiceMode = false
+            self.restart_timer?.invalidate()
+            self.recognitionTask?.cancel()
+            self.recognitionRequest = nil
+            self.voice_timer?.invalidate()
+            self.audioEngine.stop()
+            //self.btnVoice.setImage(UIImage(systemName: "mic.circle.fill"), for: .normal)
+            self.btnVoice.setTitle("Start Mic", for: .normal)
+            self.btnVoice.backgroundColor = UIColor.systemGreen
+            sayReady(text: "finished")
             self.stopCamera()
             self.camView.isHidden = true
             self.imageView.isHidden = false
@@ -110,10 +163,13 @@ class ViewController: UIViewController, UIImagePickerControllerDelegate, UINavig
     }
     
     func imagePickerController(_ picker: UIImagePickerController, didFinishPickingMediaWithInfo info: [UIImagePickerController.InfoKey : Any]) {
-        image = info[UIImagePickerController.InfoKey.originalImage] as? UIImage
+        print("imagePickerController")
+        self.txtVoice.text = ""
+        var image = info[UIImagePickerController.InfoKey.originalImage] as? UIImage
         image = image!.resized(to: CGSize(width: CGFloat(PrePostProcessor.inputWidth), height: CGFloat(PrePostProcessor.inputHeight)*image!.size.height/image!.size.width))
         imageView.image = image
         self.dismiss(animated: true, completion: nil)
+        self.detectObject()
     }
     
     // start BCJ
@@ -131,80 +187,158 @@ class ViewController: UIViewController, UIImagePickerControllerDelegate, UINavig
             }
         }
     }
-
+    
+    @objc func sayReady(text: String = "ready") {
+        try? audioSession.setMode(AVAudioSession.Mode.spokenAudio)
+        synthesizer.speak(AVSpeechUtterance(string: text))
+    }
+    
     @IBAction func startVoice(_ sender: Any) {
         NSLog("begin startVoice")
         voiceTapped()
+        _ = Timer.scheduledTimer(withTimeInterval: 2, repeats: false) { timer in
+            try? audioSession.setMode(.measurement)
+            self.startListen(self)
+        }
+        NSLog("end startVoice")
+    }
+    
+    @IBAction func startListen(_ sender: Any) {
+        NSLog("begin startListen")
         if (self.btnVoice.title(for: .normal)=="Voice") {
             return
         }
-        do {
-            self.txtVoice.text = ""
-            
-            try audioSession.setCategory(.playAndRecord, mode: .measurement, options: .duckOthers)
-            try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
-            let inputNode = audioEngine.inputNode
+        self.txtVoice.text = ""
+        
+        audioEngine.reset()
+        if recognitionTask != nil {
+                recognitionTask?.cancel()
+                recognitionTask = nil
+        }
 
-            // Configure the microphone input.
-            let recordingFormat = inputNode.outputFormat(forBus: 0)
-            inputNode.removeTap(onBus: 0)
-            inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { (buffer: AVAudioPCMBuffer, when: AVAudioTime) in
-                self.recognitionRequest?.append(buffer)
-            }
+        // Create and configure the speech recognition request.
+        recognitionRequest = SFSpeechAudioBufferRecognitionRequest()
+        guard let recognitionRequest = recognitionRequest else { fatalError("Unable to create a SFSpeechAudioBufferRecognitionRequest object") }
+        recognitionRequest.shouldReportPartialResults = true
 
-            audioEngine.prepare()
-            try audioEngine.start()
-            
-            // Create and configure the speech recognition request.
-            recognitionRequest = SFSpeechAudioBufferRecognitionRequest()
-            guard let recognitionRequest = recognitionRequest else { fatalError("Unable to create a SFSpeechAudioBufferRecognitionRequest object") }
-            recognitionRequest.shouldReportPartialResults = true
-            
-            self.voice_timer = Timer.scheduledTimer(timeInterval: 2, target: self, selector: #selector(self.processVoice), userInfo: nil, repeats: false)
-            
-            // Setup a recognition task for the speech recognition session.
-            // Keep a reference to the task so that it can be canceled.
-            self.recognitionTask = speechRecognizer.recognitionTask(with: recognitionRequest) { result, error in
-                var isFinal = false
-                //NSLog("recognizing...")
-                if let result = result {
-                    self.txtVoice.text = result.bestTranscription.formattedString
-                    //NSLog(result.bestTranscription.formattedString)
-                    isFinal = result.isFinal
-                }
-                if isFinal {
-                    NSLog("is final")
-                    self.audioEngine.stop()
-                    inputNode.removeTap(onBus: 0)
-                    self.recognitionTask!.cancel()
-                    self.recognitionRequest = nil
-                } else if (error == nil) {
-                    NSLog("reset timer")
-                    self.voice_timer?.invalidate()
-                    self.voice_timer = Timer.scheduledTimer(timeInterval: 2, target: self, selector: #selector(self.processVoice), userInfo: nil, repeats: false)
-                }
+        // Configure the microphone input.
+        let inputNode = audioEngine.inputNode
+
+        // Setup a recognition task for the speech recognition session.
+        // Keep a reference to the task so that it can be canceled.
+        self.continuous_timer = Timer.scheduledTimer(timeInterval: 10, target: self, selector: #selector(self.restartListen), userInfo: nil, repeats: false)
+        
+        self.recognitionTask = speechRecognizer.recognitionTask(with: recognitionRequest) { result, error in
+            var isFinal = false
+            //NSLog("recognizing...")
+            if result != nil {
+                print("result != nil")
+                self.restart_timer?.invalidate()
+                self.restart_timer = Timer.scheduledTimer(timeInterval: 0.5, target: self, selector: #selector(self.didFinishTalk), userInfo: nil, repeats: false)
+                
+                let bestString = result?.bestTranscription.formattedString
+                self.fullsTring = bestString!
+                self.txtVoice.text = bestString
+                isFinal = result!.isFinal
                 
             }
-            
-        } catch {
-            NSLog("error in startVoice")
+            if isFinal {
+                print("final")
+                self.audioEngine.stop()
+                inputNode.removeTap(onBus: 0)
+                self.recognitionRequest = nil
+                self.recognitionTask = nil
+                isFinal = false
+            }
+            if error != nil{
+                print("error != nil")
+                URLCache.shared.removeAllCachedResponses()
+                guard let task = self.recognitionTask else {
+                    return
+                }
+                task.cancel()
+                task.finish()
+            }
         }
-        NSLog("end startVoice")
+        audioEngine.reset()
+        inputNode.removeTap(onBus: 0)
+        
+        //let recordingFormat = AVAudioFormat(standardFormatWithSampleRate: 44100, channels: 1)
+        let recordingFormat = inputNode.outputFormat(forBus: 0)
+        inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { (buffer, when) in
+            self.recognitionRequest?.append(buffer)
+        }
+        
+        audioEngine.prepare()
+        
+        do {
+            try audioEngine.start()
+        } catch {
+            print("audioEngine couldn't start because of an error.")
+        }
+        self.imgMic.image = UIImage(systemName: "mic.fill")
+
+        NSLog("end startListen")
+    }
+    
+    @objc func restartListen(_ forceReset: Bool=false){
+        print("restartListen")
+        //print(self.txtVoice.text)
+        if (forceReset ||
+            self.txtVoice.text.contains("restart") ||
+            self.txtVoice.text.contains("reset") ||
+            self.txtVoice.text.contains("clear")) {
+            
+            self.continuous_timer?.invalidate()
+            self.restart_timer?.invalidate()
+            if ((self.audioEngine.isRunning)){
+                self.audioEngine.stop()
+                self.recognitionRequest?.endAudio()
+                self.recognitionTask?.finish()
+            }
+            if self.voiceMode {
+                self.camView.isHidden = false
+                self.imageView.isHidden = true
+                self.relaunch_timer = Timer.scheduledTimer(timeInterval: 0.2, target: self, selector: #selector(startListen), userInfo: nil, repeats: false)
+            }
+        }
+    }
+    
+    @objc func didFinishTalk(){
+        print("didFinishTalk")
+        if processVoice() {
+            self.continuous_timer?.invalidate()
+            self.restart_timer?.invalidate()
+            self.relaunch_timer?.invalidate()
+            
+            if ((self.audioEngine.isRunning)){
+                self.imgMic.image = UIImage(systemName: "mic.slash")
+                self.audioEngine.stop()
+                guard let task = self.recognitionTask else {
+                    return
+                }
+                task.cancel()
+                task.finish()
+            }
+        }
     }
 
     @IBAction func endVoice(_ sender: Any) {
     }
     
-    @objc private func processVoice() {
+    @objc private func processVoice() -> Bool {
         NSLog("begin processVoice")
-
+        if (detectingState) {
+            return true
+        }
+        if (self.txtVoice.text.contains("restart") ||
+            self.txtVoice.text.contains("reset") ||
+            self.txtVoice.text.contains("clear")) {
+            restartListen()
+        }
+        var recognizedCommand = false
         if let sentenceEmbedding = NLEmbedding.sentenceEmbedding(for: .english) {
             let sentence = self.txtVoice.text.lowercased()+""
-            //NSLog(sentence)
-
-            //if let vector = sentenceEmbedding.vector(for: sentence) {
-                //print(vector)
-            //}
             var commandScores = [Double]()
             let knownCommands = ["what is this",
                                  "tell me what this is",
@@ -214,6 +348,20 @@ class ViewController: UIViewController, UIImagePickerControllerDelegate, UINavig
                                  "pattern",
                                  "what pattern is this",
                                  "tell me which pattern this is",
+                                 "fabric",
+                                 "what fabric is this",
+                                 "tell me which fabric this is",
+                                 "garment",
+                                 "what garment is this",
+                                 "tell me which garment this is",
+                                 "kind of garment",
+                                 "clothing",
+                                 "what clothing is this",
+                                 "tell me which clothing this is",
+                                 "kind of clothing",
+                                 "item",
+                                 "what item is this",
+                                 "tell me which item this is",
                                  //"is this a [item]",
                                  //"is this [color]",
                                  //"is this [pattern]",
@@ -226,50 +374,50 @@ class ViewController: UIViewController, UIImagePickerControllerDelegate, UINavig
             }
             let bestScore = commandScores.min()
             if (bestScore! < 0.5) {
-                self.voiceTapped()
-                self.audioEngine.stop()
-                self.audioEngine.inputNode.removeTap(onBus: 0)
-                self.recognitionTask!.cancel()
-                self.recognitionRequest = nil
-                //try? self.audioSession.setActive(false)
-
+                print("set image after NLP")
+                self.imageView.image = self.camImage
+                self.camView.isHidden = true
+                self.imageView.isHidden = false
                 let bestCommand = commandScores.firstIndex(of: bestScore!)
                 switch bestCommand! {
-                case 0 ... 1:
-                    self.detectObject()
-                case 2 ... 4:
-                    self.txtVoice.text = self.txtVoice.text + "? I don't know how to do that yet."
-                    NSLog("detect color to be implemented")
-                    break
-                    //self.detectColor()
-                case 5 ... 7:
-                    self.txtVoice.text = self.txtVoice.text + "? I don't know how to do that yet."
-                    NSLog("detect pattern to be implemented")
-                    break
-                    //self.detectPattern()
-                default:
-                    break
+                    case 0 ... 1:
+                        self.detectObject(detect_type: "all")
+                    case 2 ... 4:
+                        self.detectObject(detect_type: "color")
+                    case 5 ... 10:
+                        self.detectObject(detect_type: "pattern")
+                    case 11 ... 21:
+                        self.detectObject(detect_type: "garment")
+                    default:
+                        break
                 }
-            } else {
-                // try again
-                NSLog("try again")
-                self.voice_timer?.invalidate()
-                self.voice_timer = Timer.scheduledTimer(timeInterval: 2, target: self, selector: #selector(self.processVoice), userInfo: nil, repeats: false)
+                recognizedCommand = true
             }
         }
-        
         NSLog("end processVoice")
+        return recognizedCommand
     }
-    
-    private func detectObject() {
+
+    private func detectObject(detect_type: String = "all") {
+        if (detectingState) {
+            return
+        }
+        detectingState = true
+        print("begin detectObject:  detecting "+detect_type)
+        PrePostProcessor.cleanDetection(imageView: self.imageView)
+        
+        try? audioSession.setMode(AVAudioSession.Mode.spokenAudio)
+        synthesizer.speak(AVSpeechUtterance(string: "detecting"))
+        
         btnRun.isEnabled = false
         btnRun.setTitle("Detecting...", for: .normal)
         self.txtVoice.text = ""
 
-        image = self.imageView.image
-        
+        let image = self.imageView.image
+
         let resizedImage = image!.resized(to: CGSize(width: CGFloat(PrePostProcessor.inputWidth), height: CGFloat(PrePostProcessor.inputHeight)))
-        
+        //print(resizedImage.hasAlpha)
+        //self.imageView.image = resizedImage // uncomment to see what the algo sees
         let imgScaleX = Double(image!.size.width / CGFloat(PrePostProcessor.inputWidth));
         let imgScaleY = Double(image!.size.height / CGFloat(PrePostProcessor.inputHeight));
         
@@ -291,14 +439,20 @@ class ViewController: UIViewController, UIImagePickerControllerDelegate, UINavig
             let nmsPredictions = PrePostProcessor.outputsToNMSPredictions(outputs: outputs, imgScaleX: imgScaleX, imgScaleY: imgScaleY, ivScaleX: ivScaleX, ivScaleY: ivScaleY, startX: startX, startY: startY, patternType: false)
             
             DispatchQueue.main.async {
-                PrePostProcessor.cleanDetection(imageView: self.imageView)
-                let pred_text = PrePostProcessor.showDetection(imageView: &self.imageView, nmsPredictions: nmsPredictions, classes: self.inferencer.classes)
+                let pred_text = PrePostProcessor.showDetection(imageView: &self.imageView, nmsPredictions: nmsPredictions, classes: self.inferencer.classes, detectType: detect_type, synth: self.long_synthesizer)
                 if (self.txtVoice.text != "") {
                     self.txtVoice.text = self.txtVoice.text + "? "
                 }
                 self.txtVoice.text = self.txtVoice.text + pred_text
                 self.btnRun.setTitle("Detect", for: .normal)
                 self.btnRun.isEnabled = true
+                
+                self.detectingState = false
+                
+                /*if self.voiceMode {  // this became annoying after each detection
+                    try? audioSession.setMode(AVAudioSession.Mode.spokenAudio)
+                    self.long_synthesizer.speak(AVSpeechUtterance(string: "ready"))
+                }*/
             }
         }
     }
@@ -343,6 +497,7 @@ extension ViewController:  AVCaptureVideoDataOutputSampleBufferDelegate{
         }
         captureDevice = device
         beginSession()
+         toggleTorch(on: true)
     }
 
     func beginSession(){
@@ -414,4 +569,13 @@ extension ViewController:  AVCaptureVideoDataOutputSampleBufferDelegate{
         session.stopRunning()
     }
 
+}
+extension ViewController: AVSpeechSynthesizerDelegate {
+    func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
+        self.restartListen(true)
+/*        if (utterance.speechString=="ready") {
+            print("finished reading out detections")
+            self.restartListen(true)
+        }*/
+    }
 }

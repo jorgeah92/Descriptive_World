@@ -7,6 +7,7 @@ Usage:
 """
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -15,70 +16,23 @@ import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
 
-"""
-BCJ added 02 Dec 2021
-"""
-def save_one_box(xyxy, im, file='image.jpg', gain=1.02, pad=10, square=False, BGR=False, save=True):
-    # Save image crop as {file} with crop size multiple {gain} and {pad} pixels. Save and/or return crop
-    xyxy = torch.tensor(xyxy).view(-1, 4)
-    b = xyxy2xywh(xyxy)  # boxes
-    if square:
-        b[:, 2:] = b[:, 2:].max(1)[0].unsqueeze(1)  # attempt rectangle to square
-    b[:, 2:] = b[:, 2:] * gain + pad  # box wh * gain + pad
-    xyxy = xywh2xyxy(b).long()
-    clip_coords(xyxy, im.shape)
-    crop = im[int(xyxy[0, 1]):int(xyxy[0, 3]), int(xyxy[0, 0]):int(xyxy[0, 2]), ::(1 if BGR else -1)]
-    if save:
-        cv2.imwrite(str(increment_path(file, mkdir=True).with_suffix('.jpg')), crop)
-    return crop
-
-"""
-BCJ added 05 Oct 2021
-"""
-import fast_colorthief
-import webcolors
-from scipy.spatial import KDTree
-from PIL import Image
-
-# inspired by:  https://stackoverflow.com/questions/9694165/convert-rgb-color-to-english-color-name-like-green-with-python
-# and by: https://medium.com/codex/rgb-to-color-names-in-python-the-robust-way-ec4a9d97a01f
-# a dictionary of all the hex and their respective names in css
-# CSS3 has 147 named colors, which is too many for human interpretation.
-# CSS2 has 16 colors: aqua, black, blue, fuchsia, gray, green, lime, maroon, navy, olive, purple, red, silver, teal, white, and yellow.
-css_color_db = webcolors.CSS2_HEX_TO_NAMES #.CSS3_HEX_TO_NAMES
-color_names = []
-rgb_values = []
-for color_hex, color_name in css_color_db.items():
-    color_names.append(color_name)
-    rgb_values.append(webcolors.hex_to_rgb(color_hex))
-color_decodes = KDTree(rgb_values)
-
-def convert_rgb_to_names(rgb_tuple):
-    distance, index = color_decodes.query(rgb_tuple)
-#    return f'closest match: {color_names[index]}'
-    return color_names[index]
-
-### end BCJ section
-
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[0]  # YOLOv5 root directory
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))  # add ROOT to PATH
-ROOT = ROOT.relative_to(Path.cwd())  # relative
+ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
 
 from models.experimental import attempt_load
 from utils.datasets import LoadImages, LoadStreams
-from utils.augmentations import letterbox # BCJ
 from utils.general import apply_classifier, check_img_size, check_imshow, check_requirements, check_suffix, colorstr, \
-    increment_path, non_max_suppression, print_args, clip_coords, scale_coords, set_logging, \
-    strip_optimizer, xyxy2xywh, xywh2xyxy
+    increment_path, non_max_suppression, print_args, save_one_box, scale_coords, set_logging, \
+    strip_optimizer, xyxy2xywh
 from utils.plots import Annotator, colors
-from utils.torch_utils import select_device, time_sync
+from utils.torch_utils import load_classifier, select_device, time_sync
 
 
 @torch.no_grad()
 def run(weights=ROOT / 'yolov5s.pt',  # model.pt path(s)
-        weights_pattern='fabric1.pt',  # model.pt path(s) # BCJ added
         source=ROOT / 'data/images',  # file/dir/URL/glob, 0 for webcam
         imgsz=640,  # inference size (pixels)
         conf_thres=0.25,  # confidence threshold
@@ -102,6 +56,7 @@ def run(weights=ROOT / 'yolov5s.pt',  # model.pt path(s)
         hide_labels=False,  # hide labels
         hide_conf=False,  # hide confidences
         half=False,  # use FP16 half-precision inference
+        dnn=False,  # use OpenCV DNN for ONNX inference
         ):
     source = str(source)
     save_img = not nosave and not source.endswith('.txt')  # save inference images
@@ -118,27 +73,49 @@ def run(weights=ROOT / 'yolov5s.pt',  # model.pt path(s)
     half &= device.type != 'cpu'  # half precision only supported on CUDA
 
     # Load model
-    w = weights[0] if isinstance(weights, list) else weights
+    w = str(weights[0] if isinstance(weights, list) else weights)
     classify, suffix, suffixes = False, Path(w).suffix.lower(), ['.pt', '.onnx', '.tflite', '.pb', '']
     check_suffix(w, suffixes)  # check weights have acceptable suffix
     pt, onnx, tflite, pb, saved_model = (suffix == x for x in suffixes)  # backend booleans
     stride, names = 64, [f'class{i}' for i in range(1000)]  # assign defaults
+    if pt:
+        model = torch.jit.load(w) if 'torchscript' in w else attempt_load(weights, map_location=device)
+        stride = int(model.stride.max())  # model stride
+        names = model.module.names if hasattr(model, 'module') else model.names  # get class names
+        if half:
+            model.half()  # to FP16
+        if classify:  # second-stage classifier
+            modelc = load_classifier(name='resnet50', n=2)  # initialize
+            modelc.load_state_dict(torch.load('resnet50.pt', map_location=device)['model']).to(device).eval()
+    elif onnx:
+        if dnn:
+            # check_requirements(('opencv-python>=4.5.4',))
+            net = cv2.dnn.readNetFromONNX(w)
+        else:
+            check_requirements(('onnx', 'onnxruntime-gpu' if torch.has_cuda else 'onnxruntime'))
+            import onnxruntime
+            session = onnxruntime.InferenceSession(w, None)
+    else:  # TensorFlow models
+        check_requirements(('tensorflow>=2.4.1',))
+        import tensorflow as tf
+        if pb:  # https://www.tensorflow.org/guide/migrate#a_graphpb_or_graphpbtxt
+            def wrap_frozen_graph(gd, inputs, outputs):
+                x = tf.compat.v1.wrap_function(lambda: tf.compat.v1.import_graph_def(gd, name=""), [])  # wrapped import
+                return x.prune(tf.nest.map_structure(x.graph.as_graph_element, inputs),
+                               tf.nest.map_structure(x.graph.as_graph_element, outputs))
 
-    # load the garment identification model
-    model = attempt_load(weights, map_location=device)  # load FP32 model
-    stride = int(model.stride.max())  # model stride
-    names = model.module.names if hasattr(model, 'module') else model.names  # get class names
-    print('garment types: ',names)
+            graph_def = tf.Graph().as_graph_def()
+            graph_def.ParseFromString(open(w, 'rb').read())
+            frozen_func = wrap_frozen_graph(gd=graph_def, inputs="x:0", outputs="Identity:0")
+        elif saved_model:
+            model = tf.keras.models.load_model(w)
+        elif tflite:
+            interpreter = tf.lite.Interpreter(model_path=w)  # load TFLite model
+            interpreter.allocate_tensors()  # allocate
+            input_details = interpreter.get_input_details()  # inputs
+            output_details = interpreter.get_output_details()  # outputs
+            int8 = input_details[0]['dtype'] == np.uint8  # is TFLite quantized uint8 model
     imgsz = check_img_size(imgsz, s=stride)  # check image size
-
-    # load the fabric pattern model
-    pattern_size=320
-    print('weights_pattern:',weights_pattern)
-    model_pattern = attempt_load(weights_pattern, map_location=device)  # load FP32 model
-    stride_pattern = int(model_pattern.stride.max())  # model stride
-    print('stride pattern:',stride_pattern)
-    names_pattern = model_pattern.module.names if hasattr(model_pattern, 'module') else model_pattern.names  # get class names
-    print('fabric patterns: ',names_pattern)
 
     # Dataloader
     if webcam:
@@ -152,15 +129,16 @@ def run(weights=ROOT / 'yolov5s.pt',  # model.pt path(s)
     vid_path, vid_writer = [None] * bs, [None] * bs
 
     # Run inference
+    if pt and device.type != 'cpu':
+        model(torch.zeros(1, 3, *imgsz).to(device).type_as(next(model.parameters())))  # run once
     dt, seen = [0.0, 0.0, 0.0], 0
-
-    for path, img, im0s, vid_cap, _ in dataset:
+    for path, img, im0s, vid_cap in dataset:
         t1 = time_sync()
-
-        #print('img.shape', img.shape)
-        img = torch.from_numpy(img).to(device)
-        img = img.half() if half else img.float()  # uint8 to fp16/32
-
+        if onnx:
+            img = img.astype('float32')
+        else:
+            img = torch.from_numpy(img).to(device)
+            img = img.half() if half else img.float()  # uint8 to fp16/32
         img = img / 255.0  # 0 - 255 to 0.0 - 1.0
         if len(img.shape) == 3:
             img = img[None]  # expand for batch dim
@@ -168,15 +146,47 @@ def run(weights=ROOT / 'yolov5s.pt',  # model.pt path(s)
         dt[0] += t2 - t1
 
         # Inference
-        visualize = increment_path(save_dir / Path(path).stem, mkdir=True) if visualize else False
-        pred = model(img, augment=augment, visualize=visualize)[0]
-        print('pred.shape', pred.shape) # use this to get the output shape for iOS conversion
+        if pt:
+            visualize = increment_path(save_dir / Path(path).stem, mkdir=True) if visualize else False
+            pred = model(img, augment=augment, visualize=visualize)[0]
+        elif onnx:
+            if dnn:
+                net.setInput(img)
+                pred = torch.tensor(net.forward())
+            else:
+                pred = torch.tensor(session.run([session.get_outputs()[0].name], {session.get_inputs()[0].name: img}))
+        else:  # tensorflow model (tflite, pb, saved_model)
+            imn = img.permute(0, 2, 3, 1).cpu().numpy()  # image in numpy
+            if pb:
+                pred = frozen_func(x=tf.constant(imn)).numpy()
+            elif saved_model:
+                pred = model(imn, training=False).numpy()
+            elif tflite:
+                if int8:
+                    scale, zero_point = input_details[0]['quantization']
+                    imn = (imn / scale + zero_point).astype(np.uint8)  # de-scale
+                interpreter.set_tensor(input_details[0]['index'], imn)
+                interpreter.invoke()
+                pred = interpreter.get_tensor(output_details[0]['index'])
+                if int8:
+                    scale, zero_point = output_details[0]['quantization']
+                    pred = (pred.astype(np.float32) - zero_point) * scale  # re-scale
+            pred[..., 0] *= imgsz[1]  # x
+            pred[..., 1] *= imgsz[0]  # y
+            pred[..., 2] *= imgsz[1]  # w
+            pred[..., 3] *= imgsz[0]  # h
+            pred = torch.tensor(pred)
         t3 = time_sync()
         dt[1] += t3 - t2
 
         # NMS
+        print("pred size", pred.shape)
         pred = non_max_suppression(pred, conf_thres, iou_thres, classes, agnostic_nms, max_det=max_det)
         dt[2] += time_sync() - t3
+
+        # Second-stage classifier (optional)
+        if classify:
+            pred = apply_classifier(pred, modelc, img, im0s)
 
         # Process predictions
         for i, det in enumerate(pred):  # per image
@@ -210,83 +220,21 @@ def run(weights=ROOT / 'yolov5s.pt',  # model.pt path(s)
                         with open(txt_path + '.txt', 'a') as f:
                             f.write(('%g ' * len(line)).rstrip() % line + '\n')
 
-                    """
-                        BCJ code added 05 Oct 2021 to detect fabric pattern inside the detected object.
-                    """
-                    # detect fabric pattern
-                    crop_img = save_one_box(xyxy, imc, file=None, BGR=False, save=False)
-                    # fabric pattern model was trained on max 320px by 320px images
-                    # step1-resize the detected object
-                    crop_size = 640, 640
-                    crop_img = Image.fromarray(crop_img)
-                    crop_img.thumbnail(crop_size) # in place transform
-                    crop_img = np.array(crop_img)
-                    # step2-cutout the center to use for pattern and color detection
-                    ctr_0 =int(crop_img.shape[0]/2)
-                    ctr_1 = int(crop_img.shape[1]/2)
-
-                    min_0 = ctr_0-int(pattern_size/2)
-                    min_0 = 0 if min_0 < 0 else min_0
-                    max_0 = ctr_0+int(pattern_size/2)
-                    max_0 = crop_img.shape[0] if max_0 > crop_img.shape[0] else max_0
-
-                    min_1 = ctr_1-int(pattern_size/2)
-                    min_1 = 0 if min_1 < 0 else min_1
-                    max_1 = ctr_1+int(pattern_size/2)
-                    max_0 = crop_img.shape[1] if max_0 > crop_img.shape[1] else max_0
-
-                    crop_img = crop_img[min_0:max_0,min_1:max_1,:]
-                    crop_img = letterbox(crop_img, pattern_size, stride=stride_pattern, auto=True)[0]
-                    # step3-transform into shape expected by pytorch
-                    crop_pattern = np.transpose(crop_img, (2,1,0))
-                    crop_pattern = np.expand_dims(crop_pattern,0)
-                    img_p = torch.from_numpy(crop_pattern).to(device)
-                    img_p = img_p / 255.0  # 0 - 255 to 0.0 - 1.0
-                    # Sometimes model_pattern is failing with RuntimeError: torch.cat(): Sizes of tensors must match except in dimension 1. Got 2 and 1 in dimension 2 (The offending index is 1)
-                    # As of 06 Oct 2021, have not identified root cause.  Initially it was sending in images that were too large.
-                    # Cropping solved much of that.  But there is still a problem.
-                    # Still occuring on 15 Nov 2021
-                    # Padded resize
-
-                    print('img_p.shape', img_p.shape)
-                    pred_pattern = model_pattern(img_p, augment=augment, visualize=visualize)[0]
-                    print('pred_pattern.shape', pred_pattern.shape) # use this to get the output shape for iOS conversion
-                    pred_pattern = non_max_suppression(pred_pattern, conf_thres, iou_thres, classes, agnostic_nms, max_det=max_det)
-                    label_p = ''
-                    for i_p, det_p in enumerate(pred_pattern):  # per image
-                        for *xyxy_p, conf_p, cls_p in reversed(det_p): # there seems to be only 1 entry in all cases?
-                            c_p = int(cls_p)
-                            label_p = None if hide_labels else (names_pattern[c_p] if hide_conf else f'{names_pattern[c_p]} {conf_p:.2f}')
-                        break # use on the first prediction
-
-                    """
-                        BCJ code added 05 Oct 2021 to detect predominant color inside the detected object.
-                    """
-                    # detect the predominant color
-                    dom_color_img = cv2.cvtColor(crop_img, cv2.COLOR_RGB2RGBA)
-                    dom_color_rgb = fast_colorthief.get_dominant_color(np.array(dom_color_img), quality=1)
-                    dom_color_name = convert_rgb_to_names(dom_color_rgb)
-
-                    c = int(cls)  # integer class
-                    label = None if hide_labels else (names[c] if hide_conf else f'{names[c]} {conf:.2f} {dom_color_name} {label_p}') # BCJ modified
-                    #label = None if hide_labels else (names[c] if hide_conf else f'{names[c]} {conf:.2f} {dom_color_name} {label_p}')
-
                     if save_img or save_crop or view_img:  # Add bbox to image
+                        c = int(cls)  # integer class
+                        label = None if hide_labels else (names[c] if hide_conf else f'{names[c]} {conf:.2f}')
                         annotator.box_label(xyxy, label, color=colors(c, True))
                         if save_crop:
                             save_one_box(xyxy, imc, file=save_dir / 'crops' / names[c] / f'{p.stem}.jpg', BGR=True)
-                s += dom_color_name+', ' # BCJ add
-                s += label_p+', ' # BCJ add
-            t4 = time_sync() # BCJ add
+
             # Print time (inference-only)
-            #print(f'{s}Done. ({t3 - t2:.3f}s)')
-            print(f'{s} Done. ({t4 - t2:.3f}s)') # BCJ change to timestamp
+            print(f'{s}Done. ({t3 - t2:.3f}s)')
 
             # Stream results
             im0 = annotator.result()
             if view_img:
                 cv2.imshow(str(p), im0)
-                cv2.waitKey(1) # 1 millisecond
+                cv2.waitKey(1)  # 1 millisecond
 
             # Save results (image with detections)
             if save_img:
@@ -319,8 +267,7 @@ def run(weights=ROOT / 'yolov5s.pt',  # model.pt path(s)
 
 def parse_opt():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--weights', nargs='+', type=str, default=ROOT / 'yolov5s.pt', help='model for garment type detection')
-    parser.add_argument('--weights-pattern', nargs='+', type=str, default='fabric1.pt', help='model for fabric pattern detection')
+    parser.add_argument('--weights', nargs='+', type=str, default=ROOT / 'yolov5s.pt', help='model path(s)')
     parser.add_argument('--source', type=str, default=ROOT / 'data/images', help='file/dir/URL/glob, 0 for webcam')
     parser.add_argument('--imgsz', '--img', '--img-size', nargs='+', type=int, default=[640], help='inference size h,w')
     parser.add_argument('--conf-thres', type=float, default=0.25, help='confidence threshold')
@@ -344,6 +291,7 @@ def parse_opt():
     parser.add_argument('--hide-labels', default=False, action='store_true', help='hide labels')
     parser.add_argument('--hide-conf', default=False, action='store_true', help='hide confidences')
     parser.add_argument('--half', action='store_true', help='use FP16 half-precision inference')
+    parser.add_argument('--dnn', action='store_true', help='use OpenCV DNN for ONNX inference')
     opt = parser.parse_args()
     opt.imgsz *= 2 if len(opt.imgsz) == 1 else 1  # expand
     print_args(FILE.stem, opt)
