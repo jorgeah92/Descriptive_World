@@ -45,7 +45,7 @@ opt['max_det']=1000  # maximum detections per image
 opt['stride']=64
 opt['device']=''  # cuda device, i.e. 0 or 0,1,2,3 or cpu
 opt['classify']=False # run 2nd stage classifier
-opt['agnostic_nms']=False  # class-agnostic NMS
+opt['agnostic_nms']=True  # class-agnostic NMS
 opt['half']=False  # use FP16 half-precision inference
 opt['classes']=None  # filter by class: --class 0, or --class 0 2 3
 opt['names'] = [f'class{i}' for i in range(1000)]  # assign defaults
@@ -148,7 +148,7 @@ def input_fn(input_data, content_type='JPEG'):
         return err
     
     # Padded resize
-    img = letterbox(im0s, opt['imgsz'], stride=opt['stride'], auto=opt['pt'])[0]
+    img = letterbox(im0s.copy(), opt['imgsz'], stride=opt['stride'], auto=opt['pt'])[0]
 
     # Convert
     img = img.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
@@ -238,7 +238,7 @@ def output_fn(prediction_output, accept):
                 output["bounding-box-attribute-name-metadata"]["class-map"][str(int(cls))] = opt['names'][int(cls)]
                 
                 if detectFabric: # toggle for fabric detection feature
-                    fabric_prediction, crop_img = detectFabricPattern(xyxy, im0s)                    
+                    fabric_prediction, crop_img = detectFabricPattern(xyxy, im0s.copy())                    
                     print("dw_ Detected fabric =", fabric_prediction)
                     output["bounding-box-attribute-name-metadata"]["fabric_predictions"].append(createMetadataFabrics(fabric_prediction))
                 
@@ -257,28 +257,31 @@ def output_fn(prediction_output, accept):
 def detectFabricPattern(xyxy, im0s):
     # detect fabric pattern
     crop_img = save_one_box(xyxy, im0s, file=None, BGR=False, save=False)
+    
     # fabric pattern model was trained on max 320px by 320px images
     # step1-resize the detected object
     crop_size = 640, 640
     crop_img = Image.fromarray(crop_img)
     crop_img.thumbnail(crop_size) # in place transform
     crop_img = np.array(crop_img)
+        
     # step2-cutout the center to use for pattern and color detection
     ctr_0 =int(crop_img.shape[0]/2)
     ctr_1 = int(crop_img.shape[1]/2)
-
+        
     min_0 = ctr_0-int(pattern_size/2)
     min_0 = 0 if min_0 < 0 else min_0
     max_0 = ctr_0+int(pattern_size/2)
     max_0 = crop_img.shape[0] if max_0 > crop_img.shape[0] else max_0
-
+        
     min_1 = ctr_1-int(pattern_size/2)
     min_1 = 0 if min_1 < 0 else min_1
     max_1 = ctr_1+int(pattern_size/2)
     max_0 = crop_img.shape[1] if max_0 > crop_img.shape[1] else max_0
-
-    crop_img = crop_img[min_0:max_0,min_1:max_1,:]
+        
+    crop_img = crop_img[min_0:max_0,min_1:max_1,:]        
     crop_img = letterbox(crop_img, pattern_size, stride=opt['ptrnstride'], auto=True)[0]
+    
     # step3-transform into shape expected by pytorch
     crop_pattern = np.transpose(crop_img, (2,1,0))
     crop_pattern = np.expand_dims(crop_pattern,0)
@@ -286,7 +289,9 @@ def detectFabricPattern(xyxy, im0s):
     img_p = img_p / 255.0  # 0 - 255 to 0.0 - 1.0
 
     pred_pattern = opt['ptrnmodel'](img_p)[0]
-    pred_pattern = non_max_suppression(pred_pattern, opt['conf_thres'], opt['iou_thres'], opt['classes'], opt['agnostic_nms'], max_det=opt['max_det'])
+    pred_pattern = non_max_suppression(pred_pattern, opt['conf_thres'], 
+                                       opt['iou_thres'], opt['classes'], 
+                                       opt['agnostic_nms'], max_det=opt['max_det'])
     
     label_p = ''
     for i_p, det_p in enumerate(pred_pattern):  # per image
@@ -299,41 +304,65 @@ def detectFabricPattern(xyxy, im0s):
     label_p = label_p.replace('_fabric', '')
     return label_p, crop_img
 
-
-# inspired by:  https://stackoverflow.com/questions/9694165/convert-rgb-color-to-english-color-name-like-green-with-python
-# and by: https://medium.com/codex/rgb-to-color-names-in-python-the-robust-way-ec4a9d97a01f
-# a dictionary of all the hex and their respective names in css
-# CSS3 has 147 named colors, which is too many for human interpretation.
-# CSS2 has 16 colors: aqua, black, blue, fuchsia, gray, green, lime, maroon, navy, olive, purple, red, silver, teal, white, and yellow.
-#import colorthief
-import fast_colorthief
-import webcolors
-from scipy.spatial import KDTree
 from PIL import Image
+import colorsys
+def whichColor(color):
+    (h,s,b) = colorsys.rgb_to_hsv(color[0]/255., color[1]/255., color[2]/255.)
+    print(f"dw_ HSB range- h: {h}, s: {s}, v: {b}")
+    colorTitle = ""
+    if 0<h<0.040 and 0.05<s<0.50 and 0.10<b<1.00:
+        colorTitle = "brown"
+    elif 0.41<h<0.111 and 0.05<s<0.50 and 0.10<b<1.00:
+        colorTitle = "red"
+    elif 0.041<h<0.111 and 0.05<s<0.50 and 0.10<b<1.00:
+        colorTitle = "beige"
+    elif 0.041<h<0.111 and 0.51<s<1.00 and 0.10<b<1.00:
+        colorTitle = "orange"
+    elif 0.112<h<0.222 and 0.05<s<0.50 and 0.10<b<1.00:
+        colorTitle = "olive"
+    elif 0.112<h<0.222 and 0.51<s<1.00 and 0.10<b<1.00:
+        colorTitle = "yellow"
+    elif 0.223<h<0.444 and 0.03<s<0.49 and 0.10<b<1.00:
+        colorTitle = "olive"
+    elif 0.223<h<0.444 and 0.05<s<1.00 and 0.10<b<1.00:
+        colorTitle = "green"
+    elif 0.445<h<0.542 and 0.05<s<1.00 and 0.10<b<1.00:
+        colorTitle = "teal"
+    elif 0.543<h<0.750 and 0.05<s<1.00 and 0.10<b<1.00:
+        colorTitle = "blue"
+    elif 0.751<h<0.778 and 0.05<s<1.00 and 0.10<b<1.00:
+        colorTitle = "purple"
+    elif 0.779<h<0.889 and 0.05<s<0.50 and 0.10<b<1.00:
+        colorTitle = "burgandy"
+    elif 0.779<h<0.889 and 0.51<s<1.00 and 0.10<b<1.00:
+        colorTitle = "pink"
+    elif 0.890<h<1.00 and 0.05<s<0.50 and 0.10<b<1.00:
+        colorTitle = "maroon"
+    elif 0.890<h<1.00 and 0.51<s<1.00 and 0.10<b<1.00:
+        colorTitle = "red"
+    elif 0<h<1.00 and 0<s<0.10 and 0.60<b<1.00:
+        colorTitle = "white"
+    elif 0<h<1.00 and 0.1<s<1.00 and 0.20<b<0.60:
+        colorTitle = "grey"
+    elif 0<h<1.00 and 0<s<1.00 and 0<b<0.20:
+        colorTitle = "black"
+    #else: # for debugging
+        #print('color not recognized')
+    return colorTitle
 
-css_color_db = webcolors.CSS2_HEX_TO_NAMES #.CSS3_HEX_TO_NAMES
-color_names = []
-rgb_values = []
-for color_hex, color_name in css_color_db.items():
-    color_names.append(color_name)
-    rgb_values.append(webcolors.hex_to_rgb(color_hex))
-color_decodes = KDTree(rgb_values)
-
-def convert_rgb_to_names(rgb_tuple):
-    distance, index = color_decodes.query(rgb_tuple)
-    return color_names[index]
+def get_dominant_color(numpy_image):
+    img = Image.fromarray(np.uint8(numpy_image)).convert('RGB')
+    img.resize((1, 1), resample=0)
+    dominant_color = img.getpixel((0, 0))
+    #print('dom color', dominant_color)
+    return dominant_color
 
 def detectColor(img_):
-#    return "feature not active"
+    #return "feature not active"
     # detect the predominant color
-#    colorFinder = colorthief.ColorThief(Image.fromarray(img_))
-#    dom_color_rgb = colorFinder.get_color(quality=1)
-
-    dom_color_img = cv2.cvtColor(img_, cv2.COLOR_RGB2RGBA)
-    dom_color_rgb = fast_colorthief.get_dominant_color(np.array(dom_color_img), quality=1)
-    dom_color_name = convert_rgb_to_names(dom_color_rgb)
+    dom_color_rgb = get_dominant_color(img_)
+    dom_color_name = whichColor(dom_color_rgb)
     return dom_color_name
-
 
 def createNormAnnotation(cls_id, ctr_x_pct, ctr_y_pct, w_pct, h_pct):
     # NOTE:  Bbox values expressed as percentage of original image width and height
@@ -391,7 +420,7 @@ def createOutputTemplate():
     return template
     
 
-if __name__ == "__main__": # remove False to run from CLI
+if False: #__name__ == "__main__": # remove False to run from CLI
     # test harness code: run this from CLI before deploying to Sagemaker Endpoint
     print("dw_start main")
     

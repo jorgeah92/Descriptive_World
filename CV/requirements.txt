@@ -1,8 +1,6 @@
 # pip install -r requirements.txt
 
 # DescriptiveWorld ----------------------------
-fast_colorthief
-webcolors
 
 # Base ----------------------------------------
 matplotlib>=3.2.2
