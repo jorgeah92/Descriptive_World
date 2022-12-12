@@ -1,4 +1,4 @@
-# Descriptive World Repo
+# Descriptive World
 ## Descriptive World Project Outfit
 
 ### Authors - Blair Jones, Jorge Hernandez, Jack Wang, Matt White
